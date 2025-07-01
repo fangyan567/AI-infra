@@ -1,0 +1,167 @@
+第七节-模型的量化
+
+1. 模型的量化使用到的int8权重文件
+https://huggingface.co/fushenshen/lession_model/blob/main/chat_q8.bin
+用的时候需要注意一点，我们需要修改代码目录demo/main.cpp中的最后一个参数为true，表示当前加载的是一个量化后的模型，请切记这一点，如果不改的话会导致程序运行段错误。
+model::LLama2Model model(tokenizer_path, checkpoint_path, false);
+2. 导出
+我们为课程/项目提供了一个模型导出工具，可能同学们还没用过。在这里要先感谢万能的Andrej karpathy，是他为我们的项目提供了一套模型权重文件的导出工具。我们先来看看这套工具（请见tools/export.py）的逻辑：
+1. 使用transformers库加载llama结构的模型
+hf_model = AutoModelForCausalLM.from_pretrained(model_path)
+hf_dict = hf_model.state_dict()
+2. 从模型的配置信息config.json构造模型参数
+if any(['config.json' in path for path in os.listdir("./")]):
+  with open(os.path.join("./", 'config.json'), 'r') as f:
+       config_json = json.load(f)
+  config.dim = config_json["hidden_size"]
+  config.n_layers = config_json["num_hidden_layers"]
+  config.n_heads = config_json["num_attention_heads"]
+  config.n_kv_heads = config_json["num_key_value_heads"]
+  config.vocab_size = config_json["vocab_size"]
+  config.hidden_dim = config_json["intermediate_size"]
+  config.norm_eps = config_json["rms_norm_eps"]
+  config.max_seq_len = config_json["max_position_embeddings"]
+3. 根据配置信息创建一个待导出的模型，并从Hugging Face的权重列表中逐一加载权重，将其赋值给该模型；
+model = Transformer(config)
+
+model.tok_embeddings.weight = nn.Parameter(hf_dict['model.embed_tokens.weight'])
+model.norm.weight = nn.Parameter(hf_dict['model.norm.weight'])
+4. 为导出的模型配置权重，权重来自Hugging Face的预训练权重；
+for layer in model.layers: # 把预训练的权重放到model的各层中
+    i = layer.layer_id
+    layer.attention_norm.weight = nn.Parameter(hf_dict[f'model.layers.{i}.input_layernorm.weight'])
+    ...
+    ...
+    layer.feed_forward.w2.weight = nn.Parameter(hf_dict[f'model.layers.{i}.mlp.down_proj.weight'])
+    layer.feed_forward.w3.weight = nn.Parameter(hf_dict[f'model.layers.{i}.mlp.up_proj.weight'])
+5. 开始导出模型的权重，这里我们需要导出的是int8权重
+5.1 首先打开输出的权重文件，filepath是我们要导出的量化模型权重路径
+out_file = open(filepath, 'wb')
+5.2 导出模型的配置参数
+hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+p = model.params
+shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+# legacy format uses negative/positive vocab size as a shared classifier flag
+if not shared_classifier:
+    p.vocab_size = -p.vocab_size
+n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+group_size = 64
+
+header = struct.pack('iiiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                     n_kv_heads, p.vocab_size, p.max_seq_len, group_size)
+out_file.write(header)
+  5.3 struct.pack简单理解就是把这几个参数(p.dim，hidden_dim，p.n_layers，p.n_heads，n_kv_heads)打包到一起，紧凑地放到header中，比如这几个配置是32，64，128，256，16，那么pack后就是这几个数字的二进制数据。
+  举个例子，32就是0b100000，64就是0b1000000，我们按照每个数字占用4个字节将它们写入到二进制文件out_file中，我们随后需要在C++中把它给读出来。在第10行代码中的，struct.pack('iiiiiiii')表示我们将这8个参数每个都是以int类型排布到header变量的内部存储空间中，每个参数占用4个字节。
+import struct
+demo_struct = struct.pack('iiii', 399, 7, 21, 33)
+print(demo_struct.hex())
+
+输出：8f010000070000001500000021000000
+  让我们来逐个解析这些数字：
+  - 399 在十六进制中是 018f。在小端模式下，它会被存储为 8f010000。01占用一个字节，8f占用一个字节。
+  - 7 在十六进制中是 07，在小端模式下，它会被存储为 07000000。
+  - 21 在十六进制中是 15，同样地，在小端模式下，它会被存储为 15000000。
+  - 33 在十六进制中是 21，在小端模式下，它会被存储为 21000000。
+  因此，当打印 demo_struct 的十六进制形式时，你会看到每个整数都被转换成了一个 4 字节的十六进制数，并且由于小端模式，最高字节（most significant byte）出现在最后。这就是为什么我们会得到 8f010000070000001500000021000000 这样的输出。
+6. 模型参数部分的量化和导出
+for layer in model.layers:
+    q, s, err = quantize_q80(layer.attention.wq.weight, group_size)
+    serialize_int8(out_file, q)
+    serialize_fp32(out_file, s) # layer.attention.wq.weight共有w个权重
+我们采用了按组量化的方法。具体来说，将一组浮点数 [3,5,2,4] 分成两个组，每个组中包含两个 fp32 数据：在[[3,5], [2,4]]中，我们计算每个组的最大值，得到 [5,4]。我们将 int8 数据类型的最大可表示值 qmax 设定为 127。基于此，我们计算每个子集的量化比例（scale），即：scale = (5 / 127, 4 / 127) ≈ (0.03937008, 0.03149606)，分别记作scale1和scale2，qmax表示int8的一个最大值，是127。
+我们将两组中的四个浮点值分别用各自组的量化比例进行量化：quant value 1 = round(3 / scale1)，quant value 2 = round(5 / scale1)，quant value 3 = round(2 / scale2)，我们用宽泛的方式进行分析，在逐组量化中，假设我们有W个权重，我们将它分成G组，每组的权重个数是W/G个。在每组中我们都求得一个最大值，记作RMAX，共有group G个。再举个实际的例子，例如现在有4个权重数据，分别是[1，3，5，-1]，每组的权重是两个。我们求出每组的最大值分别是3和5，根据对称量化公式
+$$Scale = \frac{|r_{max}|}{|q_{max}|}$$
+这里的量化系数是按组来求得的，随后我们再对输入数据进行量化，其中r表示原始浮点数据，q表示量化后输出的整型数据。
+$$q = Round(\frac{r}{scale})$$
+第一组：q= r = [3,5] / 该组的量化系数 = 76.19999756, 126.99999594，round之后 76，127
+第二组：q = r =[2,4] / 该组的量化系数 = 63.50000603, 127.00001207，round之后 64，127
+- 首先将[3,5,2,4] 4个权重分成两组，每组是2个fp32数据。
+- 随后对每组求出一个最大值分别5，4
+- 随后对各组求出scale , qmax = 127，scale各组分别等于0.03937008, 0.03149606
+- 量化的值 round(3/0.039) = 76，round(2/0.031) = 64
+- 对应到代码，我们就是
+for layer in model.layers:
+   q, s, err = quantize_q80(layer.attention.wq.weight, group_size)
+   serialize_int8(out_file, q)
+   serialize_fp32(out_file, s)
+其中q是量化后的整型数据，s是求得的量化系数。比如说原先要保存1024个float32数据，如果不量化的话需要占用4096个字节。如果现在进行量化，并且组的大小(group size)为64，也就是每64个浮点数据共用一个量化系数scale。那么现在占用的只有1024个int8数据，加上1024 / 64 =16个float32数据（scale，每组64个浮点权重共享），总共占用1024 + 64字节，大大减少了空间的占用。当完成以上的步骤时，我们输出的权重文件大致有以下的排布。
+----------------
+part 1
+模型的配置参数 
+----------------
+part 2
+w1 layer: [int8权重参数] × layer num + [权重系数] × layer num
+w2 layer: [int8权重参数] × layer num + [权重系数] × layer num
+----------------
+part 3
+不参与量化的权重
+----------------
+如上是模型导出后的模型权重文件的数据排布情况。
+1. 首先是模型的配置参数，包括layer num，hidden num等信息。
+2. 随后就是模型中各层的参数，依次存放的是各类型各层量化后的权重和每组共享的量化系数。
+3. 最后就是不参加量化的权重，例如embedding table和rmsnorm层的权重等。
+3. 命令行导出权重的办法
+python export_llama.py --version 3 --hf TinyLlama/TinyLlama-1.1B-Chat-v1.0 chat_q8.bin
+TinyLlama/TinyLlama-1.1B-Chat-v1.0是我们指定的huggingface模型名称，这里要注意的是只能选取LLama系列的模型。export_llama.py是我们要用到的导出脚本，用于llama2模型的导出。
+在使用导出的权重文件后，由于是LLama2的推理阶段，所以我们需要关闭Llama3的选项，也就是需要设置
+-DLLAMA3_SUPPORT=OFF
+其中export_llama2.py和config.json文件位于KuiperLlama项目的tools文件夹下。
+4. 加载
+4.1 加载参数
+我们先来看看模型的权重参数配置部分是怎么被读取的，在model.cpp中我们直接从二进制权重文件的首部读取模型的配置文件。也就是刚才我们在Python端导出的一组参数，它们分别是p.dim, hidden_dim, p.n_layers, p.n_heads,
+n_kv_heads, p.vocab_size, p.max_seq_len, group_size
+auto config = ModelConfig{};
+if (fread(&config, sizeof(ModelConfig), 1, file) != 1) {
+  return error::ModelParseError(
+      "Failed to retrieve the configuration information from the model "
+      "file.");
+}
+我们来看一下ModelConfig的结构，我们这里是从二进制模型权重文件头部中读取相关的配置信息。并存放在这个结构中。
+struct ModelConfig {
+  int32_t dim = 0;
+  int32_t hidden_dim = 0;
+  int32_t layer_num = 0;
+  int32_t head_num = 0;
+  int32_t kv_head_num = 0;
+  int32_t vocab_size = 0;
+  int32_t seq_len = 0;
+};
+我们在视频中来看看这部分读取后是怎么样子的，和存放进去时候的数值是不是保持相同的。
+4.2 加载权重
+        我们来看看当文件被打开后，是如何从二进制模型文件中加载权重的。打开大型文件的方法我们会在以后的课时中讲到，这里我们先看看在文件打开后是如何加载的，以query层为例。
+for (int32_t i = 0; i < config_->layer_num_; ++i) {
+  auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
+  wq->set_group_size(group_size_);
+  wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+  llama_layers_->wq_layers_.push_back(wq);
+  pos = pos + dim * dim + wq->get_scale_num() * sizeof(float);
+}
+其中pos指向我们当前权重文件中的偏移位置，wq是新初始化出来的线性层，我们在set_weight中对它完成权重赋值。我们还记得在N×N个权重之后还存放了N×N/GROUP SIZE 个量化系数，所以我们需要用两部分把它读出来。
+base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr, base::DeviceType device_type) {
+
+    size_t size = std::accumulate(dims.begin(), dims.end(), sizeof(float), std::multiplies<>());
+    // 将模型权重文件中的权重数据赋值给buffer
+    std::shared_ptr<base::Buffer> buffer =
+        std::make_shared<base::Buffer>(size, nullptr, (void*)(weight_ptr), true);
+    if (device_type != base::DeviceType::kDeviceUnknown) {
+        buffer->set_device_type(device_type);
+    }
+首先我们将权重weight_ptr（维度为dims）读取到Buffer结构中，这里的权重赋值直接用了指针复用的方式，而不是直接重新拷贝dims维度的权重数据到tensor中。为了存放系数数据我们还在Layer算子类中增加了一个scale类型为Tensor的变量，这就是我们在前文中说到的量化系数。
+base::Status LayerParam::set_weight(...){
+    ...
+    ...
+    tensor::Tensor weight(base::DataType::kDataTypeInt8, dims);
+    weight.set_device_type(device_type);
+    CHECK(weight.assign(buffer));
+    weights_.at(idx) = weight;
+}
+随后读取scale_nums个权重系数
+int32_t scale_nums = weight_size / group_size_;
+scales_ = tensor::Tensor{base::DataType::kDataTypeFp32, scale_nums, false, nullptr, reinterpret_cast<float*>((int8_t*)weight_ptr + weight_size)};
+
+scales_.set_device_type(device_type);
+权重系数开始的位置就如同我们上文所说的那样，是在权重结束作为开始的（摆放在某一层权重数据结束的位置上），也就是weight_ptr + weight_size的位置，scales_num等于权重的个数除以每组的权重数量，之所以这么算是因为权重每group_size个共享一个系数。
+5. 计算
+在完成上述的权重和系数读取之后，我们每一个MatmulLayer中都有一个weight张量（tensor），和系数数据（scales）。那么应该如何来完成计算呢？我们现在知道的信息是每个Matmul层中有M个权重数据为int8类型，且有scale_num个权重系数，这里我们假设矩阵大小为2×4且group size等于2，原先在完成一个矩阵相乘是这样的。
+[图片]
+具体的计算因为会涉及到CUDA部分所以会放到后面讲解，我们会先将quant weight中的每个整型权重按照它原本所属的组(group)去乘以每组相关的量化系数，得到浮点权重矩阵，随后再将浮点权重矩阵乘以输入矩阵得到最终的结果。
