@@ -1,0 +1,136 @@
+第十节-mmap映射模型文件
+
+1. 用mmap读取模型权重文件
+mmap 是 用于内存映射的函数，它是一种在用户空间的程序和一个或多个文件或其他对象之间创建直接的内存访问接口的方法。通过内存映射，操作系统将一个文件或者其它对象映射到进程的地址空间中，使得文件的内容可以直接作为进程内存的一部分来读写。具体可以参考以下的文档：
+https://www.man7.org/linux/man-pages/man2/mmap.2.html
+利用内存映射技术来打开大文件进行读写主要有以下的几点好处：
+1. 内存映射允许你以字节为单位来访问文件，这使得对模型权重等二进制数据的随机访问变得更加简单和直观，以下是这种优势的具体例子：
+// 大模型文件的路径
+char *filename = "large_model.bin";
+
+// 打开文件，只读方式
+int fd = open(filename, O_RDONLY);
+if (fd == -1) {
+    perror("open");
+    exit(EXIT_FAILURE);
+}
+
+// 映射文件到内存
+void *mapped_address;
+mapped_address = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+if (mapped_address == MAP_FAILED) {
+    perror("mmap");
+    exit(EXIT_FAILURE);
+}
+// 访问权重文件的第32个字节开始的数据，是不是很方便，像访问内存一样访问文件
+*(mapped_address + 32)
+
+// 使用映射的内存
+// 假设我们想读取文件中的前10个字节
+char first_ten_bytes[11];  // +1 for null terminator
+strncpy(first_ten_bytes, mapped_address, 10);
+first_ten_bytes[10] = '\0';  // Ensure null termination
+printf("First ten bytes: %s\n", first_ten_bytes);
+代码第5行中，我们使用open方法打开一个权重文件路径，返回文件描述符，再在第13行中将它映射到以mapped_address起始的地址中。
+换句话说，mapped_address地址开始的第一个字节就是large_model.bin文件的第一个字节。所以在第21行开始的代码中，我们如果要读取权重文件的前10个字节数据，我们可以直接对mapped_address
+2. 对于非常大的模型文件，可能无法一次性全部加载到内存中。内存映射允许按需加载逐页部分数据，这样可以在有限的内存中处理更大的模型，大模型动辄几十个G。也就是说，内存映射并不是将打开文件中所有字节一次性读入到内存中，而是根据访问的位置进行分块读取。
+  换句话说，使用 mmap() 后，程序可以直接在内存地址上进行操作，而不需要关心文件读写的位置。这意味着可以用简单的指针操作来替代复杂的文件偏移量管理。
+3. 减少数据拷贝次数：传统的文件读取操作需要将数据从内核缓冲区复制到用户空间的缓冲区，而内存映射则避免了这种复制，通过将打开的文件直接映射到进程地址空间的办法提高了数据访问速度。
+[图片]
+2. 回顾模型导出时的细节
+我们在前面的视频中讲过，我们为了得到用于执行模型的权重数据和模型相关的配置信息。
+filepath = "test.bin"
+out_file = open(filepath, 'wb')
+
+hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+p = model.params
+shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+
+if not shared_classifier:
+    p.vocab_size = -p.vocab_size
+# 导出配置信息，作为权重的第一个部分
+n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                     n_kv_heads, p.vocab_size, p.max_seq_len)
+out_file.write(header)
+在导出模型阶段，我们打开了filepath文件并将dim，hidden_dim，layer num，heads num等配置信息导出到输出文件中，随后我们要在C++推理阶段打开模型文件并读取。
+3. 映射权重文件到内存空间中
+打开模型文件的方法就如上面所说的那样，可以分为下面的几个步骤：
+1. 用系统调用接口open打开文件地址，获取打开的文件描述符fd，open系统调用会打开pathname参数指定的文件，如果文件路径存在且被成功执行后就会返回文件描述符，它是一个非负的整数值。
+int open(const char *pathname, int flags);
+2. 从功能上来说，open系统调用创建了一个新的文件描述项，也就是在一个系统全局的已打开文件表中添加一条记录。
+3. 获取文件的大小，用于将整个权重文件范围都映射到内存空间中；
+FILE* file = fopen(model_path_.data(), "rb");
+fseek(file, 0, SEEK_END);
+auto file_size = ftell(file);
+首先是使用C库的fopen函数打开权重文件，获取文件结构体指针同时我们将文件的读写位置移动到末尾SEEK_END，随后再读取文件当前的读写位置就可以获得整个文件的大小。
+简单来说，就是打开一个文件，并将文件的读写地址移动到结尾，随后再获取结尾地址的位置就可以获取整个模型文件的大小。
+4. 读取模型文件起始位置的配置信息，也就是前文模型导出时候存入的配置信息；
+3.1 python存入配置信息的部分
+header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                     n_kv_heads, p.vocab_size, p.max_seq_len)
+out_file.write(header)
+3.2 用内存映射方法读取配置信息
+auto config = ModelConfig{};
+fread(&config, sizeof(ModelConfig), 1, file)
+
+struct ModelConfig {
+  int32_t dim = 0;
+  int32_t hidden_dim = 0;
+  int32_t layer_num = 0;
+  int32_t head_num = 0;
+  int32_t kv_head_num = 0;
+  int32_t vocab_size = 0;
+  int32_t seq_len = 0;
+};
+其中ModelConfig是一个结构体，从文件结构体file中读取前面的sizeof(ModelConfig)字节个作为后续的配置信息，换句话说我们刚才用struct.pack方法打包并写入到权重文件的配置信息，都会在此时被读取出来。让我们来运行TEST(test_load, load_model_config)单元测试来验证对模型中配置文件的读取，在开始运行之前记得先调整这里的工作目录为你的本地项目所在目录：
+[图片]
+TEST(test_load, load_model_config) {
+  std::string model_path = "./tmp/test.bin";
+  int32_t fd = open(model_path.data(), O_RDONLY);
+  ASSERT_NE(fd, -1);
+
+  FILE* file = fopen(model_patyinweih.data(), "rb");
+  ASSERT_NE(file, nullptr);
+
+  auto config = model::ModelConfig{};
+  fread(&config, sizeof(model::ModelConfig), 1, file);
+  ASSERT_EQ(config.dim, 16);
+  ASSERT_EQ(config.hidden_dim, 128);
+  ASSERT_EQ(config.layer_num, 256);
+}
+从模型权重文件test.bin中读取配置文件，随后再验证这些值是否是和导出时相等的。
+3.3 python中存入权重数据的部分
+weight = torch.arange(dim * hidden_dim).reshape(dim, hidden_dim)
+serialize_fp32(out_file, weight)
+我们在导出权重文件的时候，往里面存入了dim × hidden_dim个连续数据，数据的大小从0到dim × hidden_dim。
+---------
+dim,hidden_dim,layer_num，...  前面的28个字节
+---------
+float 权重
+---------
+3.4 用内存映射读取权重信息
+TEST(test_load, load_model_weight) {
+  std::string model_path = "./tmp/test.bin";
+  int32_t fd = open(model_path.data(), O_RDONLY);
+  ASSERT_NE(fd, -1);
+
+  FILE* file = fopen(model_path.data(), "rb");
+  ASSERT_NE(file, nullptr);
+
+  auto config = model::ModelConfig{};
+  fread(&config, sizeof(model::ModelConfig), 1, file);
+
+  fseek(file, 0, SEEK_END);
+  auto file_size = ftell(file);
+
+  void* data = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  float* weight_data =
+      reinterpret_cast<float*>(static_cast<int8_t*>(data) + sizeof(model::ModelConfig));
+
+  for (int i = 0; i < config.dim * config.hidden_dim; ++i) {
+    ASSERT_EQ(*(weight_data + i), float(i));
+  }
+}
+此处我们用先前打开的文件描述符fd进行内存映射，将文件中的值映射到以addr为起始位置的一片内存区域中，但是值得注意的是，由于权重文件的前面数个字节是配置信息，也就是前文中的hidden_dim和dim等，所以我们需要将映射起始位置之前将加sizeof(ModelConfig)字节以跳过配置信息所在的位置，得到权重数据开始的位置，也就是weight_data。
+以上代码清单中的第15行，file_size表示权重文件的大小，也就是我们需要将整个权重文件进行内存映射。第三个参数PROT_READ表示映射后的内存区域权限仅是可读的（因为我们只需要读取权重文件），参数MAP_PRIVATE表示映射后的内存区域是当前进程私有的，其中对映射区域的任何更改都不会影响原始文件或其它进程的映射，随后我们从weight_data中读取权重并进行验证。因为我们在模型导出的时候，使用torch.arange(dim * hidden_dim)生成了dim × hidden_dim个连续数据，所以我们要在此处进行验证是否被成功地写入了并且值就是从0到dim × hidden_dim的一组连续排列。
