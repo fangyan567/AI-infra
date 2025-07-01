@@ -1,0 +1,271 @@
+第九节-显存的管理
+
+1. Cuda的向量化存取回顾
+我们在前文中讲到，在不同的设备上为了屏蔽底层内存申请、释放和拷贝方法接口的不同，我们设计了Allocator父类，我们在不同设备上都要实现该父类的所有接口。
+class DeviceAllocator {
+ public:
+  explicit DeviceAllocator(DeviceType device_type) : device_type_(device_type) {}
+
+  virtual DeviceType device_type() const { return device_type_; }
+
+  virtual void release(void* ptr) const = 0; // 要实现的内存分配接口
+ 
+  virtual void* allocate(size_t byte_size) const = 0; // 要实现的内存释放接口
+
+  virtual void memcpy(const void* src_ptr, void* dest_ptr, size_t byte_size,
+              MemcpyKind memcpy_kind = MemcpyKind::kMemcpyCPU2CPU,  void* stream = nullptr, bool need_sync = false) const;
+
+  virtual void memset_zero(void* ptr, size_t byte_size, void* stream, bool need_sync = false);
+
+ private:
+  DeviceType device_type_ = DeviceType::kDeviceUnknown;
+};
+其中最重要的是allocate和release接口，用于在不同设备上申请和释放内存，换句话说就是要对不同的Allocator子类都实现这两个方法。我们先来看一下CPU设备上两个接口的实现：
+void* CPUDeviceAllocator::allocate(size_t byte_size) const {
+  if (!byte_size) {
+    return nullptr;
+  }
+  data = malloc(byte_size);
+  return data;
+
+}
+
+void CPUDeviceAllocator::release(void* ptr) const {
+  if (ptr) {
+    free(ptr);
+  }
+}
+可以看到就只是简单的调用了两个系统接口，没有任何多余的动作。使用方法如下所示：
+void * ptr = allocator->allocate(byte_size); // 申请byte_size字节大小的内存
+allocator->release(ptr); // 释放申请的内存空间
+2. GPU Allocator的实现
+我们先来看一个最简单的实现：
+void* CUDADeviceAllocator::allocate(size_t byte_size) const {
+  if (!byte_size) {
+    return nullptr;
+  }
+  void* ptr = nullptr;
+  cudaError_t err = cudaMalloc(&ptr, byte_size);
+  CHECK_EQ(err, cudaSuccess);
+  return ptr;
+}
+
+void CUDADeviceAllocator::release(void* ptr) const {
+  if (ptr) {
+    cudaFree(ptr);
+  }
+}
+CUDADeviceAllocator是Allocator父类的另一个子类，表示显卡设备上的内存申请和释放器。最简单实现就是直接调用两个运行时方法cudaMalloc和cudaFree来申请释放显存。
+3. 更复杂的实现
+3.1 显存申请方式
+cudaMalloc等系统接口有一定耗时，所以我们需要再一定程度上避免重复的申请和释放。对于小块显存，不先cudaFree还给系统，而是先保存起来，以后用到的时候直接返回该块显存既可。
+1. 我们将内存申请的情况分为两种，一种是申请大小大于1MB的情况，我们在使用cudaMalloc分配之后还需要将它记录到全局变量big_buffers中，另外如果big_buffers数组中有符合大小需求的内存块且无使用者就直接返回该内存块。
+     当所需的大块内存2048kb被分配前，我们会先big_buffers里找空闲且大小大于2048kb的内存块
+[图片]
+void* CUDADeviceAllocator::allocate(size_t byte_size) const {
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    CHECK(state == cudaSuccess);
+    if (byte_size > 1024 * 1024) {  // 申请的字节数大于1mb
+        auto& big_buffers = big_buffers_map_[id]; //
+        int sel_id = -1;
+        for (int i = 0; i < big_buffers.size(); i++) {
+            // 遍历big buffers里的每一个项目，满足要求的（内存块的大小大于所需要，busy是false）
+            if (big_buffers[i].byte_size >= byte_size && !big_buffers[i].busy &&
+                big_buffers[i].byte_size - byte_size < 1 * 1024 * 1024) {
+                // 在big buffer数组找到的显存块大小满足要求
+                if (sel_id == -1 || big_buffers[sel_id].byte_size > big_buffers[i].byte_size) {
+                    sel_id = i;
+                }
+            }
+        }
+        // 直接返回找到符合的要求的项
+        if (sel_id != -1) {
+            big_buffers[sel_id].busy = true;
+            return big_buffers[sel_id].data;
+        }
+
+        // 如果没找到空闲的，再去调用cudaMalloc
+        void* ptr = nullptr;
+        state = cudaMalloc(&ptr, byte_size);
+        if (cudaSuccess != state) {
+            char buf[256];
+            snprintf(buf, 256,
+                     "Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory "
+                     "left on  device.",
+                     byte_size >> 20);
+            LOG(ERROR) << buf;
+            return nullptr;
+        }
+        big_buffers.emplace_back(ptr, byte_size, true);
+        return ptr;
+    }
+从以上代码看出，如果申请的显存字节数大于1MB，那么我们就先从big_buffers数组中找到无人使用（busy等于false）且大于所需显存字节的内存块，就直接返回。如果没找到空闲的才会使用cudaMalloc系统接口，去申请对应字节的显存块并将它放到big_buffers数组中。
+2. 如果是小块的显存，同理我们有一个cuda_buffers_来记录已经分配出去的显存块，同样地如果cuda_buffers_中有空闲空间满足内存申请者的需要（空闲显存块 > 申请需要）就直接返回，否则才会使用cudaMalloc系统接口去分配显存块，并将它放到cuda_buffers数组中做记录，就想下图所示的那样。
+[图片]
+auto& cuda_buffers = cuda_buffers_map_[id];
+for (int i = 0; i < cuda_buffers.size(); i++) {
+    if (cuda_buffers[i].byte_size >= byte_size && !cuda_buffers[i].busy) {
+        cuda_buffers[i].busy = true;
+        no_busy_cnt_[id] -= cuda_buffers[i].byte_size; // 在申请的回收，有一块表中的显存块被申请了，空闲的数量也需要减少
+        return cuda_buffers[i].data;
+    }
+}
+
+void* ptr = nullptr;
+state = cudaMalloc(&ptr, byte_size);
+if (cudaSuccess != state) {
+    char buf[256];
+    snprintf(buf, 256,
+             "Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory "
+             "left on  device.",
+             byte_size >> 20);
+    LOG(ERROR) << buf;
+    return nullptr;
+}
+cuda_buffers.emplace_back(ptr, byte_size, true); // 将申请到的“小”块显存放到cuda_buffers表中
+可以从代码的第3-6行看出，如果buffer_maps_中有符合需要的显存块就直接返回并将这一块的忙闲位busy置位true，表示该块显存已经被使用。如果没有的话，同样需要调用cudaMalloc系统接口去申请显存，并放到cuda_buffers中。
+3.2 内存释放
+我们从显存申请的流程可以知道，当我们需要申请一小块显存的时，还会被记录在一个类似”使用表“的结构buffer_maps_中，并将其中的对应项设为忙位（也就是busy等于true）。
+在随后的显存释放中我们会将释放内存的指针和表项目中进行对比，如果是buffer_maps_的一项，直接将busy位设置为false就行，而不需要调用系统接口cudaFree释放显存。
+[图片]
+void CUDADeviceAllocator::release(void* ptr) const {
+    // ...
+    // ...
+    // 以上为清空buffer_maps_的情况
+    for (auto& it : cuda_buffers_map_) {
+        auto& cuda_buffers = it.second;
+        for (int i = 0; i < cuda_buffers.size(); i++) {
+            if (cuda_buffers[i].data == ptr) {
+                no_busy_cnt_[it.first] += cuda_buffers[i].byte_size; // 空闲的内存大小加释放的byte_size大小
+                cuda_buffers[i].busy = false;
+                return;
+            }
+        }
+如果现在系统申请频率大于释放，就会使得buffer_maps_中空闲显存块越来越多，整个系统可以被cudaMalloc的显存就慢慢不足，所以在满足一定阈值（大于1024 * 1024 * 1024）的情况下我们还是需要清空buffer_maps_中记录的显存项的。
+void CUDADeviceAllocator::release(void* ptr) const {
+    for (auto& it : cuda_buffers_map_) {
+        if (no_busy_cnt_[it.first] > 1024 * 1024 * 1024) {
+            auto& cuda_buffers = it.second; // 找到要清理的cuda_buffers
+            std::vector<CudaMemoryBuffer> temp;
+            for (int i = 0; i < cuda_buffers.size(); i++) {
+                if (!cuda_buffers[i].busy) { // 如果这个表项为空闲
+                    state = cudaSetDevice(it.first);
+                    state = cudaFree(cuda_buffers[i].data);
+                    CHECK(state == cudaSuccess)
+                        << "Error: CUDA error when release memory on device " << it.first;
+                } else {
+                    temp.push_back(cuda_buffers[i]);
+                }
+            }
+            cuda_buffers.clear();
+            it.second = temp;
+            no_busy_cnt_[it.first] = 0; // 在清理完毕之后置为0
+        }
+    }
+从第3行可以看出，判定的阈值条件是如果buffer_maps_中记录空闲(busy等于false)的显存块占用的显存字节带下大于1GB，那么我们就逐个的使用cudaFree清空buffer_maps_中的显存。
+no_busy_cnt_[it.first] > 1024 * 1024 * 1024
+我们再来看看这里的no_busy_cnt_是什么：当我们还回去一块显存的时候，除了将对应显存项位置为false表示当前项指向的显存块是空闲的，还会将no_busy_cnt的值加上该块显存的大小，当no_busy_cnt的大小（也就是当前空闲内存）大于阈值的时候就会像上面所说的那样进行清空。另外，对于大块显存，也就是big_buffers中记录的显存块，直接归还显存而不做特殊处理。
+void CUDADeviceAllocator::release(void* ptr) const { 
+    // 处理buffer_maps_中的显存块
+    auto& big_buffers = big_buffers_map_[it.first];
+    for (int i = 0; i < big_buffers.size(); i++) {
+        if (big_buffers[i].data == ptr) {
+            big_buffers[i].busy = false;
+            return;
+        }
+    }
+
+    state = cudaFree(ptr);
+}
+我们来简单梳理一下以上的流程：
+1. 当申请显存块大小的时候，按照大小分为大块显存和小块显存，如果系统中有空闲的显存块且大小符合规则，且没有被占用，就直接返回对应显存块。如果没有的话就重新申请一块，并按照大小放在big_buffers_或者cuda_buffers_中两个结构中以供记录。
+2. 当释放显存的时候，我们根据显存块的大小来将big_buffers或cuda_buffers中的某项置为空闲。如果空闲的内存块太多，我们则会集中释放一批显存块来降低系统对显存的占用。
+3. 等到空闲显存块(cuda buffers数组中)的字节总数大于1gb，才会开始清理。
+4. 张量数据的互相转换
+为了方便tensor中数据的互转，我们打算开发to_cuda方法和to_cpu方法。我们先来回忆一下tensor类的定义：
+class Tensor {
+ public:
+   // ...
+   // ...
+ private:
+  size_t size_ = 0;
+  std::vector<int32_t> dims_;
+  std::shared_ptr<base::Buffer> buffer_; // buffer在初始化的时候，调用构造函数。最后tensor相关的数据指针是buffer->ptr
+  base::DataType data_type_ = base::DataType::kDataTypeUnknown;
+};
+buffer_中记录的ptr指针既可以指向一块显存，也可以指向一块内存。buffer在被初始化的时候，会根据其设备的类型调用对应设备上的内存分配器。
+Buffer::Buffer(size_t byte_size, std::shared_ptr<DeviceAllocator> allocator, void* ptr,
+               bool use_external) // 构造函数
+    : byte_size_(byte_size),
+      allocator_(allocator),
+      ptr_(ptr),
+      use_external_(use_external) {
+  if (!ptr_ && allocator_) {
+    device_type_ = allocator_->device_type();
+    use_external_ = false;
+    ptr_ = allocator_->allocate(byte_size); // 根据tensor的类型，buffer去调用对应设备的内存分配器去分配内、显存
+  }
+}
+如果当前device_type表示CPU类型，那么allocator->allocate方法会调用malloc方法去分配内存，并以ptr指向这块被新分配的内存中。如果device_type是GPU类型，那么allocator->allocate就会调用前文的流程去申请一块显存，同时ptr会记录新分配的显存位置。
+那么如果我们要将一个CPU类型的Tensor变为一个GPU类型的Tensor，我们需要完成什么工作呢？我们对照着流程来看Tensor类的to_cuda方法。
+1. 申请一块和原来CPU上占用字节大小相同的显存的CudaBuffer；
+void Tensor::to_cuda(cudaStream_t stream) {
+    const base::DeviceType device_type = this->device_type();
+    size_t byte_size = this->byte_size();
+    auto cu_alloc = base::CUDADeviceAllocatorFactory::get_instance();
+    auto cu_buffer = std::make_shared<base::Buffer>(byte_size, cu_alloc); // 去申请byte_size字节大小的显存
+    cu_alloc->memcpy(buffer_->ptr(), cu_buffer->ptr(), byte_size, base::MemcpyKind::kMemcpyCPU2CUDA,
+                 stream);
+我们先得到CUDA设备上的内存分配器，也就是我们在前文中实现的CUDADeviceAllocator的一个实例，随后再用它分配和原来tensor占用字节数大小的显存块cu_buffer.
+2. 将原先CPU张量上的数据（保存于buffer_）拷贝到新创建的显存块cu_buffer上，所以现在我们调用cu_alloc的memcpy方法
+cu_alloc->memcpy(buffer_->ptr(), cu_buffer->ptr(), byte_size, base::MemcpyKind::kMemcpyCPU2CUDA,
+                 stream);// 把原先cpu上的数据同步到了cuda上
+buffer->ptr()表示原来CPU上的内存块指针，cu_buffer->ptr()表示新创建的显存块指针，显存的拷贝方向是从CPU到CUDA。
+void DeviceAllocator::memcpy(const void* src_ptr, void* dest_ptr, size_t byte_size,
+                             MemcpyKind memcpy_kind, void* stream, bool need_sync) const {
+    CHECK_NE(src_ptr, nullptr);
+    CHECK_NE(dest_ptr, nullptr);
+    if (!byte_size) {
+        return;
+    }
+
+    cudaStream_t stream_ = nullptr;
+    if (stream) {
+        stream_ = static_cast<CUstream_st*>(stream);
+    }
+    
+    // ...
+    // ...
+    if (memcpy_kind == MemcpyKind::kMemcpyCPU2CUDA) {
+        if (!stream_) {
+            cudaMemcpy(dest_ptr, src_ptr, byte_size, cudaMemcpyHostToDevice);
+        } else {
+            auto e = cudaGetLastError();
+            cudaMemcpyAsync(dest_ptr, src_ptr, byte_size, cudaMemcpyHostToDevice, stream_);
+        }
+    }
+}
+在cu_alloc的memcpy方法中我们再调用cudaMemCpy方法完成数据从CPU到CUDA的拷贝，换句话说我们将原来buffer_中的数据通过cudaMemcpy拷贝到了新创建的显存块cudaBuffer的ptr中。
+this->buffer_ = cu_buffer;
+当数据拷贝同步完成之后，我们再将该张量的类内变量buffer_指向cu_buffer，从此完成了张量数据到显存的过程。
+5. 单元测试
+TEST(test_tensor, to_cu) {
+  using namespace base;
+  auto alloc_cpu = CPUDeviceAllocatorFactory::get_instance();
+  tensor::Tensor t1_cpu(DataType::kDataTypeFp32, 32, 32, true, alloc_cpu);
+  ASSERT_EQ(t1_cpu.is_empty(), false);
+  float* p1 = t1_cpu.ptr<float>();
+  for (int i = 0; i < 32 * 32; ++i) {
+    *(p1 + i) = 1.f;
+  }
+
+  t1_cpu.to_cuda();
+  float* p2 = new float[32 * 32];
+  cudaMemcpy(p2, t1_cpu.ptr<float>(), sizeof(float) * 32 * 32, cudaMemcpyDeviceToHost);
+  for (int i = 0; i < 32 * 32; ++i) {
+    ASSERT_EQ(*(p2 + i), 1.f);
+  }
+  delete[] p2;
+}
+我们先创建了一个CPU类型的张量t1_cpu，并将其中的所有值置为1。随后我们调用to_cu()方法将数据同步到显存上，最后再用单元测试逐个元素检查其中的值是否均为1.
