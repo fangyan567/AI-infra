@@ -1,0 +1,240 @@
+第三节-算子类的设计
+
+1. 引言
+在深度学习中，算子通常指的是在神经网络中对数据执行数学运算的函数。这些运算可以是简单的，如加法、乘法，也可以是复杂的，如卷积、池化、归一化等。
+算子是构建神经网络模型的基础，它们定义了数据在网络中的流动方式以及如何通过这种流动进行特征提取和学习。根据算子内部参数的有无，我们大致可以将算子分为两大类：
+1. 带参数的，例如卷积算子，全连接算子，rmsnorm算子等
+2. 不带参数的，例如sigmoid算子，softmax算子等
+另外我们还需要为量化算子预留设计空间（后续课程中会实现），但是下文中主要考虑的是带参（fp32）和不带参的两类算子。以后我们实现的所有算子类型都要继承于这两个基类型。
+2. 算子基类
+我们先来看其中的类内变量，这些变量包括表示算子类型的layer_type，表示算子处理数据类型的data_type，以及表示算子所属设备类型的device_type。此外，我们还有相应的方法来返回这些类型，例如device_type()和layer_type()等分别获取算子类型和设备类型。
+另外还有一些纯虚方法我们放到BaseLayer的派生类Layer中去实现，项目中算子的实现有fp32类型的，也有int8类型的，如果用设备类型来分，我们的算子(Layer)既有cpu上的实现，也有gpu上的实现。
+class BaseLayer {
+ public:
+  explicit BaseLayer(base::DeviceType device_type, LayerType layer_type,
+                     base::DataType data_type, std::string layer_name = "");
+
+  base::DataType data_type() const;
+
+  LayerType layer_type() const;
+
+  ...
+  ...
+      
+  const std::string& get_layer_name() const; // 返回层的名字
+
+  void set_layer_name(const std::string& layer_name); // 设置层的名称
+
+  base::DeviceType device_type() const; // 返回层的设备类型
+
+  void set_device_type(base::DeviceType device_type);
+
+ protected:
+  std::string layer_name_; // 层名
+  LayerType layer_type_ = LayerType::kLayerUnknown; // 层类型
+  base::DataType data_type_ = base::DataType::kDataTypeUnknown; // 层数据类型
+  base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
+};
+3. 不带参（权重）算子类的设计
+不带参的算子就是那些add，softmax等没有权重的算子
+3.1 设置输入输出的部分
+Y =  x
+我们来看看BaseLayer第一个不带参数的派生类Layer，我们来看看其中的类内变量inputs_和outputs，它们将于用于存放每个算子中的输入和输出张量。
+class Layer : public BaseLayer {
+ public:
+  explicit Layer(base::DeviceType device_type, LayerType layer_type,
+                 std::string layer_name = "");
+  // set_input(0,x1)
+  // set_input(1,x2)
+  void set_input(int32_t idx, const tensor::Tensor& input) override; // 传入输入
+  
+  // set_output(0,y)
+  void set_output(int32_t idx, const tensor::Tensor& output) override; // 传入输出
+
+  const tensor::Tensor& get_input(int32_t idx) const override; // 获取输入
+
+  const tensor::Tensor& get_output(int32_t idx) const override; // 获取输出
+
+  size_t input_size() const override; // 获取输入的个数
+
+  size_t output_size() const override; // 获取输出的个数
+
+  void reset_input_size(size_t size);
+
+  void reset_output_size(size_t size);
+
+  virtual void to_cuda();
+
+ private:
+  std::vector<tensor::Tensor> inputs_;  // 存放输入的数组
+  std::vector<tensor::Tensor> outputs_; // 存放输出的数组
+};
+比如我们需要对输入做add运算，那么我们就需要先通过set_input方法将输入放到inputs_变量中，放入的方法见set_input。比如有个add层，@0和@1两个输入数，set_input()
+在set_input方法中我们需要指定这是该算子的第几个(idx)输入，input是具体的输入张量，关于张量的概念，我们会在下一节课程中讲解。set_input方法中我们需要先检查idx是否超出了该算子输入的个数限制，比如ReLU算子就只能有一个输入，另外还要再检查该输入的数据类型(data type)是否和算子的设备类型(device type)是一致的。
+同时也需要将用于存放的张量通过set_output方法放到outputs_变量中，方法的方法见set_output。
+void Layer::set_input(int32_t idx, const tensor::Tensor& input) {
+  CHECK_GE(idx, 0);
+  CHECK_LT(idx, inputs_.size());
+  if (!input.is_empty()) {
+    CHECK(input.device_type() == device_type_);
+  }
+  this->inputs_.at(idx) = input;
+}
+get_input则是set_input的反过程，从类中获取到第idx个输入张量用于做后续运算。另外还有些关于算子输入、输出张量的辅助函数，例如获取数量的input_size和output_size。
+3.2 调用计算的部分
+在用set_input和set_output设置好输入和输出张量之后，我们就要调用最关键的计算方法了，对于每个算子都需要去重写Layer::base_foward，例如ReLU的base_forward方法中需要重写完成以下的过程。
+$$relu(x) = max(x,0)$$
+同理对于其他类型的算子，例如Softmax算子，也要重写Softmax::base_forward。我们举个例子来看一下，Add算子的base_forward是怎么被重写的，可以看到base_forward是一个重载函数。
+base::Status base_forward() override; // 每个算子的计算过程都有些不同，所以需要重写base_forward.
+
+base::Status VecAddLayer::base_forward() {
+  auto status = this->check();
+  if (!status) {
+    return status;
+  }
+  auto input1 = this->get_input(0);
+  auto input2 = this->get_input(1);
+  auto output = this->get_output(0);
+  kernel::get_add_kernel(device_type_)(input1, input2, output, nullptr);
+  return base::error::Success();
+}
+先是用get_input方法分别取出输入张量，随后再用get_output取出输出张量，随后再调用计算过程对两个输入中的数据进行一一加和。这里get_input获取到的输入张量是在调用base_forward之前，通过set_input传入并保存的，get_output同理。张量的定义会在下一节课当中讲。
+我们再来看一个RoPE算子中计算函数的重写实现，也就是RoPELayer::base_forward()，同样是先从inputs_取出三个输入数据，分别是input_q和input_k以及input_pos，随后我们再调用它的计算过程得到最终的结果。在这里，请同学们先不要纠结计算过程是怎么写的，本节课的目的就是要先理解算子整体的设计，而不是一开始就把头扎到算子具体实现中。
+值得说一句的是，以上代码(base_forward)中我们调用了check()方法，check方法同样是一个重载方法，每个算子派生类都要重写它用于检查调用过程中输入参数数量的合法性，我们先来看一下AddLayer中check方法的实现。
+base::Status VecAddLayer::check() const {
+  tensor::Tensor input1 = this->get_input(0);
+  tensor::Tensor input2 = this->get_input(1);
+  int32_t size = input1.size();
+  base::Status status;
+  status = check_tensor_with_dim(input1, device_type_, data_type_, size);
+  if (!status) {
+    LOG(ERROR) << "The input tensor 1 error in the add layer.";
+    return status;
+  }
+  // 我的输入是cpu上的数据，而我的layer(device type)是gpu的
+  status = check_tensor_with_dim(input2, device_type_, data_type_, size);
+  if (!status) {
+    LOG(ERROR) << "The input tensor 2 error in the add layer.";
+    return status;
+  }
+
+  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, size);
+  if (!status) {
+    LOG(ERROR) << "The output tensor error in the add layer.";
+    return status;
+  }
+  return base::error::Success();
+}
+我们在forward方法中调用了check方法，check方法先是得到两个输入张量用于做检查，分别记作变量input1和变量input2，随后我们再检查它们两个的维度是否是一致的，最后就是检查数据类型是否正确，设备类型是否正确。
+1. 我们知道算子类本身有一个数据类型为data_type_，我们这里要检查输入的数据类型是否为data_type_；
+2. 算子类本身也有一个设备类型为device_type_，我们这里也要检查输入张量的设备类型是否也为device_type。
+为什么要检查？因为我们的算子实现在不同设备上有不同的实现，CPU上有CPU上的算子实现，CUDA上有CUDA的算子实现，所以我们也要确保传入的输入和算子的计算过程是符合的，比如我们如果用CUDA写了一个算子计算过程，那么传入的输入上的数据必定要存储在显存之上。
+张量类我们将在下一讲中涉及到。
+4. 带参数的算子类设计
+带参数的算子类，多了一个类内变量用于存储权重张量：
+
+class LayerFp32Param : public Layer {
+ public:
+  explicit LayerFp32Param(base::DeviceType device_type, LayerType layer_type,
+                          std::string layer_name = "");
+
+  size_t weight_size() const;
+
+  void reset_weight_size(size_t size);
+
+  tensor::Tensor& get_weight(int32_t idx);
+
+  const tensor::Tensor& get_weight(int32_t idx) const;
+
+  void set_weight(int32_t idx, const tensor::Tensor& weight);
+
+  void set_weight(int32_t idx, const std::vector<int32_t>& dims, const float* weight_ptr,
+                  base::DeviceType device_type = base::DeviceType::kDeviceUnknown);
+
+ private:
+  std::vector<tensor::Tensor> weights_; // 用于额外存放权重数据
+};
+其中weights_变量用于存放权重张量，例如matmul和rmsnorm算子中的权重。我们来看看这两个算子是怎么取得权重张量的，我们来看看rmsnorm算子的计算过程base_forward实现。
+base::Status RmsNormLayer::base_forward() { // 计算的时候
+  auto status = check();
+  if (!status) {
+    return status;
+  }
+  auto input = this->get_input(0);
+  auto weight = this->get_weight(0);
+  auto output = this->get_output(0);
+  // 得到一个具体的算子计算实现
+  kernel::get_rmsnorm_kernel(device_type_)(input, weight, output,
+                                           cuda_config_ ? cuda_config_->stream : nullptr);
+  return base::error::Success();
+}
+我们通过get_weight方法来取得对应的权重张量，再做相应的运算，同样是先前通过set_weight方法完成对某个算子的权重赋值。kernel::get_rmsnorm_kernel(device_type_)方法用于根据设备类型获取不同的算子实现。和权重有关的还有其他一些辅助方法，类似获取算子中权重张量的个数weight_size，重置权重的个数reset_weight_size等等。
+5. 获取不同设备的算子实现
+base::Status VecAddLayer::base_forward() {
+  auto status = this->check();
+  if (!status) {
+    return status;
+  }
+  auto input1 = this->get_input(0);
+  auto input2 = this->get_input(1);
+  auto output = this->get_output(0);
+  kernel::get_add_kernel(device_type_)(input1, input2, output);
+  return base::error::Success();
+}
+
+AddKernel get_add_kernel(base::DeviceType device_type) {
+  if (device_type == base::DeviceType::kDeviceCPU) {
+    return add_kernel_cpu; // 返回一个具体的函数指针
+  } else if (device_type == base::DeviceType::kDeviceCUDA) {
+    return add_kernel_cu;
+  } else {
+    LOG(FATAL) << "Unknown device type for get a add kernel.";
+    return nullptr;
+  }
+}
+如果当前的设备类型是cpu，那么就返回add_kernel_cpu方法用于运算；反之如果设备是cuda，那么我们就返回add_kernel_cu用于在N卡上进行运算。
+void add_kernel_cpu(const tensor::Tensor& input1, const tensor::Tensor& input2,
+                    const tensor::Tensor& output) {
+  arma::fvec input_vec1(const_cast<float*>(input1.ptr<float>()), input1.size(), false,
+                        true);
+  arma::fvec input_vec2(const_cast<float*>(input2.ptr<float>()), input2.size(), false,
+                        true);
+  arma::fvec output_vec(const_cast<float*>(output.ptr<float>()), output.size(), false,
+                        true);
+  output_vec = input_vec1 + input_vec2;
+}
+来看看add_kernel_cpu中的计算过程实现，该方法接收两个输入并将它们加和放到结果output中。所以链路就是：
+1. base_forward调用
+2. 在base_forward方法中get input and weight以及输出
+3. select kernel，根据设备类型选择算子实现
+kernel::get_add_kernel(device_type_)(input1, input2, output); 选中kernel实现后，我们将向kernel传入必要的输入、输出和权重张量，这里我们根据设备类型是cpu，选中了add_kernel_cpu实现。
+4. 向函数指针传入数个input和weight并完成，并将结果放到output中。只简单介绍一下这里的计算流程，因为不是本节课的重点：
+  1. 用第一个输入张量赋值input_vec1
+  2. 用第二个输入张量赋值input_vec2
+  3. 随后我们调用Armadillo数学库的+加法计算得到最终的输出值，并保存在output_tensor中。
+  input_vec1和input_vec都是数学库Armdillo中的向量表示
+6. 算子练习
+我们来看一下加法算子的整体流程，两个张量是如何被相加并放到输出张量中的。
+TEST(test_add_cu, add1_nostream) {
+  auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
+
+  int32_t size = 32 * 151;
+
+  tensor::Tensor t1(base::DataType::kDataTypeFp32, size, true, alloc_cu);
+  tensor::Tensor t2(base::DataType::kDataTypeFp32, size, true, alloc_cu);
+  tensor::Tensor out(base::DataType::kDataTypeFp32, size, true, alloc_cu);
+
+  set_value_cu(static_cast<float*>(t1.get_buffer()->ptr()), size, 2.f);
+  set_value_cu(static_cast<float*>(t2.get_buffer()->ptr()), size, 3.f);
+
+  kernel::get_add_kernel(base::DeviceType::kDeviceCUDA)(t1, t2, out, nullptr);
+  cudaDeviceSynchronize();
+  float* output = new float[size];
+  cudaMemcpy(output, out.ptr<float>(), size * sizeof(float), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < size; ++i) {
+    ASSERT_EQ(output[i], 5.f);
+  }
+
+  delete[] output;
+}
+我们先是准备了两个张量，分别是t1和t2，再将两者赋值每个位置的元素均赋值为值2和值3，再调用get_add_kernel选择cuda算子对两个输入进行计算，并将结果和“5.f”进行比较。
