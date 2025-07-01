@@ -1,0 +1,134 @@
+第十二节-算子后端的选择
+
+1. CPU算子加载权重
+我们在前文中说到，每个算子的权重都是在new一个算子之后，再用mmap映射打开的权重进行赋值的，总体流程如下：
+auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
+wq->set_group_size(group_size_);
+wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+首先，我们使用 make_shared 在第一行初始化一个全连接算子，得到 wq。众所周知，raw_model_data 是通过 mmap 对权重模型文件进行内存映射得到的地址。换句话说，raw_model_data 指向的是权重模型文件中存储的数据，而 pos 则代表了该算子对应的权重在文件中的位置。
+[图片]
+我们将以pos开始的，截止到pos + dim * dim位置的权重赋值给该算子，作为该算子的权重。那么我们应该怎么把权重加载GPU上呢？
+2. 把权重同步到GPU           
+当我们把权重读取到CPU上的时候，如果这个算子是GPU类型的，也就是后期会用GPU功能完成计算的，我们就还要把权重上传到GPU上，同时还需要在运算开始前将所有的输入和输出上传到GPU上，具体流程看如下代码：
+void LayerParam::to_cuda() {
+  Layer::to_cuda();
+  for (auto& weight : weights_) {
+    weight.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+  }
+  ...
+}
+在第二行中调用带参数算子的父类方法Layer::to_cuda()上传输入输出到GPU上，随后带参数子类LayerParam再将自身的权重上传到GPU上，此处的weight变量是一个张量Tensor实例，我们来看一下to_cuda方法的实现：
+void Tensor::to_cuda(cudaStream_t stream) {
+  CHECK_NE(buffer_, nullptr);
+  // 得到当前张量tensor的类型
+  const base::DeviceType device_type = this->device_type();
+  if (device_type == base::DeviceType::kDeviceUnknown) {
+    LOG(ERROR) << "The device type of the tensor is unknown.";
+  } else if (device_type == base::DeviceType::kDeviceCPU) {
+     // 如果当前的设备类型是cpu类型，那么我们就需要将它拷贝到gpu上
+    size_t byte_size = this->byte_size();
+    auto cu_alloc = base::CUDADeviceAllocatorFactory::get_instance();
+    // 使用CUDA Allocator分配一块buffer，专门用于存放gpu上的权重 
+    auto cu_buffer = std::make_shared<base::Buffer>(byte_size, cu_alloc);
+    // 
+    cu_alloc->memcpy(buffer_->ptr(), cu_buffer->ptr(), byte_size, base::MemcpyKind::kMemcpyCPU2CUDA,
+                     stream);
+    this->buffer_ = cu_buffer;
+  } else {
+    LOG(INFO) << "The device type of the tensor is already cpu.";
+  }
+}
+当调用to_cuda方法的时候我们先检查当前张量的类型，如果是CPU类型的才会上传到显存中。
+首先是获取GPU上的内存分配器cu_alloc，随后再申请一块和CPU上权重数据大小相同的显存，随后再将原来CPU上的数据拷贝过去。在cu_alloc->memcpy方法中有如下实现：
+void DeviceAllocator::memcpy(const void* src_ptr, void* dest_ptr, size_t byte_size, MemcpyKind memcpy_kind, void* stream, bool need_sync) const {
+    CHECK_NE(src_ptr, nullptr);
+    CHECK_NE(dest_ptr, nullptr);
+    if (!byte_size) {
+        return;
+    }
+
+    cudaStream_t stream_ = nullptr;
+    if (stream) {
+        stream_ = static_cast<CUstream_st*>(stream);
+    }
+    if (memcpy_kind == MemcpyKind::kMemcpyCPU2CPU) {
+        std::memcpy(dest_ptr, src_ptr, byte_size);
+    } else if (memcpy_kind == MemcpyKind::kMemcpyCPU2CUDA) {
+        cudaMemcpy(dest_ptr, src_ptr, byte_size, cudaMemcpyHostToDevice);
+    }
+} 
+参数中的src_ptr和dest_ptr分别是CPU上的权重地址和GPU上的权重地址，GPU上的权重存储空间来自于我们在上一步骤中申请的buffer。
+注意：
+这里的buffer申请了一块GPU上的显存空间，显存空间的大小和CPU上的权重大小是一致的，我们只需要用CudaMemcpy拷贝既可。
+3. 算子后端选择
+上文中说过，算子的实现分为两种，一种是在cpu上做计算，另外一种是在gpu上做计算，我们提供了两种形式的算子，所以在调用的时候需要根据需要进行自由选择：
+base::Status MatmulLayer::forward() {
+    auto status = check();
+    if (!status) {
+        return status;
+    }
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+        CHECK(cuda_config_ != nullptr);
+    }
+
+    kernel::get_matmul_kernel(device_type_)(get_input(0), get_weight(0), get_output(0), 1.f, cuda_config_ ? cuda_config_.get() : nullptr);
+    return base::error::Success();
+}
+我们在调用Matmul算子的时候会根据当前算子的设备类型进行选取，也就是在第10行的时候会根据device_type根据对应的类型选取不同平台上的实现。
+MatmulKernel get_matmul_kernel(base::DeviceType device_type) {
+    if (device_type == base::DeviceType::kDeviceCPU) {
+        return matmul_kernel_cpu;
+    } else if (device_type == base::DeviceType::kDeviceCUDA) {
+        return matmul_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get an matmul kernel.";
+        return nullptr;
+    }
+}
+如果传入的device_type是cpu的，我们就返回matmul_kernel_cpu，反之则返回matmul_kernel_cpu类型的，两个返回值都是函数指针MatmulKernel类型的函数。我们来看看两个函数的接口定义：
+void matmul_kernel_cpu(const tensor::Tensor& input, const tensor::Tensor& weight, const tensor::Tensor& output, float scale, const CudaConfig* config)
+另外一个是：
+void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,const tensor::Tensor& output, const float scale, const CudaConfig* config)
+可以看出这两个函数的函数接口定义（参数、返回值等）都是相同的，所以能用同一个函数指针MatmulKernel表示。
+4. 单元测试 
+我们会在这个单元测试中调用不同设备类型上的算子，看看它们的功能计算是否是一致的，见test文件夹下的test_cu_mamtul.cpp。
+代码第5-6行我们创建了两个cpu上的张量，分别是input和weight，input张量的维度是4×1，而weight张量的维度是4×4. 在第22-23行中，我们再将这两个tensor上传到GPU中，流程见上面的两节。
+随后在第30和第32行分别获取两个设备上的算子实现（分别是CUDA和CPU实现）并分别调用，最后再得到两个后端上的推理结果是否相同。
+TEST(test_matmul_cu, matmul_linear_stream5) {
+  auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  
+  // 分别创建输入和权重张量
+  tensor::Tensor input(base::DataType::kDataTypeFp32, 4, true, alloc_cpu);
+  tensor::Tensor weight(base::DataType::kDataTypeFp32, 4, 4, true, alloc_cpu);
+
+  for (int i = 0; i < 4; ++i) {
+    input.index<float>(i) = float(i);
+  }
+
+  for (int i = 0; i < 16; ++i) {
+    weight.index<float>(i) = float(i);
+  }
+    
+    
+    
+  tensor::Tensor input_cpu = input.clone();
+  tensor::Tensor weight_cpu = weight.clone();
+
+  input.to_cuda(nullptr);
+  weight.to_cuda(nullptr);
+
+  tensor::Tensor out_cu(base::DataType::kDataTypeFp32, 4, true, alloc_cu);
+  tensor::Tensor out_cpu(base::DataType::kDataTypeFp32, 4, true, alloc_cpu);
+  // ...
+  // ....
+    
+  kernel::get_matmul_kernel(base::DeviceType::kDeviceCUDA)(input, weight, out_cu, 1.f, config);
+
+  kernel::get_matmul_kernel(base::DeviceType::kDeviceCPU)(input_cpu, weight_cpu, out_cpu, 1.f, config);
+
+  out_cu.to_cpu();
+  for (int i = 0; i < out_cu.size(); ++i) {
+    ASSERT_EQ(out_cu.index<float>(i), out_cpu.index<float>(i));
+  }
+}
